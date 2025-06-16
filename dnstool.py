@@ -36,12 +36,13 @@ from impacket.krb5.ccache import CCache
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal
 from impacket.krb5 import constants
-from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, SASL, KERBEROS
+from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, SASL, KERBEROS, Tls
 from lib.utils.kerberos import ldap_kerberos
 import ldap3
 from impacket.ldap import ldaptypes
 import dns.resolver
 import datetime
+import ssl
 
 def print_m(string):
     sys.stderr.write('\033[94m[-]\033[0m %s\n' % (string))
@@ -335,7 +336,7 @@ def main():
 
     #Main parameters
     #maingroup = parser.add_argument_group("Main options")
-    parser.add_argument("host", type=str,metavar='HOSTNAME',help="Hostname/ip or ldap://host:port connection string to connect to")
+    parser.add_argument("host", type=str,metavar='HOSTNAME',help="ldap://host or ldaps://host connection string to connect to")
     parser.add_argument("-u","--user",type=str,metavar='USERNAME',help="DOMAIN\\username for authentication.")
     parser.add_argument("-p","--password",type=str,metavar='PASSWORD',help="Password or LM:NTLM hash, will prompt if not specified")
     parser.add_argument("--forest", action='store_true', help="Search the ForestDnsZones instead of DomainDnsZones")
@@ -348,7 +349,7 @@ def main():
                         '(KRB5CCNAME) based on target parameters. If valid credentials '
                         'cannot be found, it will use the ones specified in the command '
                         'line')
-    parser.add_argument('-port', default=389, metavar="port", type=int, help='LDAP port, default value is 389')
+    parser.add_argument('-port', metavar="port", type=int, default=0, help='LDAP port, default value is 389 for ldap and 636 for ldaps. You can override this here.')
     parser.add_argument('-force-ssl', action='store_true', default=False, help='Force SSL when connecting to LDAP server')
     parser.add_argument('-dc-ip', action="store", metavar="ip address", help='IP Address of the domain controller. If omitted it will use the domain part (FQDN) specified in the target parameter')
     parser.add_argument('-dns-ip', action="store", metavar="ip address", help='IP Address of a DNS Server')
@@ -372,6 +373,24 @@ def main():
 
 
     args = parser.parse_args()
+
+    # Parse the URI to have the scheme and determine the port (if not overrided in args.port)
+    host_uri = args.host
+    if not (host_uri.startswith("ldap://") or host_uri.startswith("ldaps://")):
+        print_f ("You should specify ldap://hostOrIP or ldaps://hostOrIP")
+        sys.exit(1)
+
+    if args.port == 0:
+        if host_uri.startswith("ldap://"):
+            args.port = 389
+            print_m("Scheme is ldap")
+        if host_uri.startswith("ldaps://"):
+            print_m("Scheme is ldaps")
+            args.port = 636
+
+    print_m (f"Target LDAP server: {host_uri}:{args.port}")
+    host = args.host.split('/')[2]
+    #print_m (f"{host}:{args.port}")
 
     #Prompt for password if not set
     authentication = None
@@ -398,7 +417,9 @@ def main():
             nthash = ''
             password = args.password
         if 'KRB5CCNAME' in os.environ and os.path.exists(os.environ['KRB5CCNAME']):
-            domain, user, TGT, TGS = CCache.parseFile(domain, user, 'ldap/%s' % args.host)
+            
+            domain, user, TGT, TGS = CCache.parseFile(domain, user, 'ldap/%s' % host)
+            print (f"[*] domain: {domain}, user: {user}, host: {host}")
         if args.dc_ip is None:
             kdcHost = domain
         else:
@@ -413,7 +434,7 @@ def main():
             sessionKey = TGT['sessionKey']
         if not TGS:
             # Request TGS
-            serverName = Principal('ldap/%s' % args.host, type=constants.PrincipalNameType.NT_SRV_INST.value)
+            serverName = Principal('ldap/%s' % host, type=constants.PrincipalNameType.NT_SRV_INST.value)
             TGS = getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey)
         else:
             # Convert to tuple expected
@@ -422,8 +443,14 @@ def main():
         sasl_mech = KERBEROS
 
     # define the server and the connection
-    s = Server(args.host, port=args.port, use_ssl=args.force_ssl, get_info=ALL)
+    if "ldaps://" in args.host:
+        print_m('Using LDAPS')
+        tls = Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2)
+        s = Server(args.host, port=args.port, use_ssl=True, tls=tls, get_info=ALL)
+    else:
+        s = Server(args.host, port=args.port, use_ssl=args.force_ssl, get_info=ALL)
     print_m('Connecting to host...')
+    print_m(s)
     c = Connection(s, user=args.user, password=args.password, authentication=authentication, sasl_mechanism=sasl_mech)
     print_m('Binding to host')
     # perform the Bind operation
@@ -435,6 +462,7 @@ def main():
     else:
         ldap_kerberos(domain, kdcHost, None, userName, c, args.host, TGS)
     print_o('Bind OK')
+    #print (s.info)
     domainroot = s.info.other['defaultNamingContext'][0]
     forestroot = s.info.other['rootDomainNamingContext'][0]
     if args.forest:
